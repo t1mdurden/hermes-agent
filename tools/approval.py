@@ -2221,6 +2221,45 @@ def _iter_shell_command_word_spans(command: str):
             break
 
 
+# A program written with a path -- `/sbin/shutdown`, `./shutdown`, `/bin/rm` --
+# never satisfies `_CMDPOS`, whose start-position class requires the BARE
+# program word immediately after a separator. Every `_CMDPOS`-anchored rule
+# therefore stops firing on the path spelling of the exact command it exists to
+# catch. Folding a command word to its basename restores the anchor without
+# touching the false-positive fix `_CMDPOS` was added for, because only words
+# the quote-aware tokenizer identifies as command-position words are folded --
+# never an argument, and never text inside quotes.
+_PROGRAM_BASENAME_RE = re.compile(r"[^\s/\\'\"]+")
+
+
+def _command_word_basename(word: str) -> str | None:
+    """`/sbin/shutdown` -> `shutdown`. None when the word carries no path."""
+    stripped = word.strip("\"'")
+    if "/" not in stripped:
+        return None
+    tail = stripped.rsplit("/", 1)[1]
+    if not tail or not _PROGRAM_BASENAME_RE.fullmatch(tail):
+        return None
+    return tail
+
+
+def _basename_command_words(command: str) -> str:
+    """Rewrite every path-bearing command-position word to its basename."""
+    pieces = []
+    last = 0
+    for word_start, word_end, word in _iter_shell_command_word_spans(command):
+        base = _command_word_basename(word)
+        if base is None or word_start < last:
+            continue
+        pieces.append(command[last:word_start])
+        pieces.append(base)
+        last = word_end
+    if not pieces:
+        return command
+    pieces.append(command[last:])
+    return "".join(pieces)
+
+
 def _command_detection_variants(command: str):
     # Mask quoted newlines BEFORE normalization: normalization strips
     # backslash-escapes (\" -> ") and empty-string pairs (""), which would
@@ -2295,6 +2334,19 @@ def _command_detection_variants(command: str):
             continue
         seen.add(variant)
         yield variant
+    # Absolute- and relative-path program spellings (#91627 companion): fold
+    # every command-position word that carries a path to its basename so the
+    # `_CMDPOS`-anchored floor rules see `shutdown` in `/sbin/shutdown -h now`.
+    # Marked form as well, so a path spelling after a real separator
+    # (`cd /tmp && /sbin/reboot`) anchors like the bare one already does.
+    for base_variant in list(seen):
+        folded = _basename_command_words(base_variant)
+        if folded == base_variant:
+            continue
+        for candidate in (folded, _mark_command_starts(folded)):
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                yield candidate
 
 
 def _is_verification_artifact_cleanup(command: str) -> bool:
